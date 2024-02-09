@@ -119,6 +119,11 @@ class LightningPerceptualModel(pl.LightningModule):
         self.perceptual_model = PerceptualModel(feat_type=self.feat_type, model_type=self.model_type, stride=self.stride,
                                                 hidden_size=self.hidden_size, lora=self.use_lora, load_dir=load_dir,
                                                 device=device)
+        mat_vit_full_dim = self.perceptual_model.extractor_list[0].model.mlp_hidden_dim
+        for extractor in self.perceptual_model.extractor_list:
+            assert mat_vit_full_dim == extractor.model.mlp_hidden_dim
+        self.mat_vit_full_dim = mat_vit_full_dim
+
         if self.use_lora:
             self.__prep_lora_model()
         else:
@@ -145,7 +150,7 @@ class LightningPerceptualModel(pl.LightningModule):
         img_ref, img_0, img_1, target, idx = batch
         opt.zero_grad()
         for mat_div, weight in zip(self.mat_div, self.mat_weight):
-            dist_0, dist_1 = self.forward(img_ref, img_0, img_1, mat_slice=(3072 // mat_div))
+            dist_0, dist_1 = self.forward(img_ref, img_0, img_1, mat_slice=(self.mat_vit_full_dim // mat_div))
             decisions = torch.lt(dist_1, dist_0)
             logit = dist_0 - dist_1
             loss = self.criterion(logit.squeeze(), target)
@@ -161,7 +166,7 @@ class LightningPerceptualModel(pl.LightningModule):
         this_loss = 0.0
         img_ref, img_0, img_1, target, id = batch
         for mat_div, weight in zip(self.mat_div, self.mat_weight):
-            dist_0, dist_1 = self.forward(img_ref, img_0, img_1, mat_slice=(3072 // mat_div))
+            dist_0, dist_1 = self.forward(img_ref, img_0, img_1, mat_slice=(self.mat_vit_full_dim // mat_div))
             decisions = torch.lt(dist_1, dist_0)
             logit = dist_0 - dist_1
             loss = self.criterion(logit.squeeze(), target)
