@@ -53,40 +53,51 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--batch_size', type=int, default=4, help='dataset batch size.')
 
+    parser.add_argument('--mat_div', type=int, nargs="+", default=[1])
+
     return parser.parse_args()
 
-
-def score_nights_dataset(model, test_loader, device):
+@torch.no_grad()
+def score_nights_dataset(model, test_loader, device, mat_div=[1]):
     logging.info("Evaluating NIGHTS dataset.")
-    d0s = []
-    d1s = []
     targets = []
-    with torch.no_grad():
-        for i, (img_ref, img_left, img_right, target, idx) in tqdm(enumerate(test_loader), total=len(test_loader)):
-            img_ref, img_left, img_right, target = img_ref.to(device), img_left.to(device), \
-                img_right.to(device), target.to(device)
+    results = {
+        div: dict(
+            d0s=[],
+            d1s=[],
+        ) for div in mat_div
+    }
+    for i, (img_ref, img_left, img_right, target, idx) in tqdm(enumerate(test_loader), total=len(test_loader)):
+        img_ref, img_left, img_right, target = img_ref.to(device), img_left.to(device), \
+            img_right.to(device), target.to(device)
 
-            dist_0 = model(img_ref, img_left)
-            dist_1 = model(img_ref, img_right)
+        target = target.unsqueeze(1)
+        targets.append(target)
+
+        for div in mat_div:
+            dist_0 = model(img_ref, img_left, mat_slice=(3072 // div))
+            dist_1 = model(img_ref, img_right, mat_slice=(3072 // div))
 
             if len(dist_0.shape) < 1:
                 dist_0 = dist_0.unsqueeze(0)
                 dist_1 = dist_1.unsqueeze(0)
             dist_0 = dist_0.unsqueeze(1)
             dist_1 = dist_1.unsqueeze(1)
-            target = target.unsqueeze(1)
 
-            d0s.append(dist_0)
-            d1s.append(dist_1)
-            targets.append(target)
+            results[div]['d0s'].append(dist_0)
+            results[div]['d1s'].append(dist_1)
 
-    d0s = torch.cat(d0s, dim=0)
-    d1s = torch.cat(d1s, dim=0)
     targets = torch.cat(targets, dim=0)
-    scores = (d0s < d1s) * (1.0 - targets) + (d1s < d0s) * targets + (d1s == d0s) * 0.5
-    twoafc_score = torch.mean(scores, dim=0)
-    logging.info(f"2AFC score: {str(twoafc_score)}")
-    return twoafc_score
+    for div in mat_div:
+        results[div] = {
+            k: torch.cat(vs, dim=0)
+            for k, vs in results[div].items()
+        }
+        d0s, d1s = results[div]['d0s'], results[div]['d1s']
+        scores = (d0s < d1s) * (1.0 - targets) + (d1s < d0s) * targets + (d1s == d0s) * 0.5
+        results[div]['twoafc_score'] = twoafc_score = torch.mean(scores, dim=0).item()
+        logging.info(f"div={div}   2AFC score: {twoafc_score:.4%}")
+    return {div: res['twoafc_score'] for div, res in results.items()}
 
 
 def get_baseline_model(baseline_model, feat_type: str = "cls", stride: str = "16",
@@ -189,14 +200,18 @@ def run(args, device):
     test_no_imagenet_loader = DataLoader(test_dataset_no_imagenet, batch_size=args.batch_size,
                                          num_workers=args.num_workers, shuffle=False)
 
-    imagenet_score = score_nights_dataset(model, test_imagenet_loader, device)
-    no_imagenet_score = score_nights_dataset(model, test_no_imagenet_loader, device)
+    imagenet_score = score_nights_dataset(model, test_imagenet_loader, device, mat_div=args.mat_div)
+    no_imagenet_score = score_nights_dataset(model, test_no_imagenet_loader, device, mat_div=args.mat_div)
 
-    eval_results['nights_imagenet'] = imagenet_score.item()
-    eval_results['nights_no_imagenet'] = no_imagenet_score.item()
-    eval_results['nights_total'] = (imagenet_score.item() * len(test_dataset_imagenet) +
-                                    no_imagenet_score.item() * len(test_dataset_no_imagenet)) / total_length
-    logging.info(f"Combined 2AFC score: {str(eval_results['nights_total'])}")
+    eval_results['nights_imagenet'] = imagenet_score
+    eval_results['nights_no_imagenet'] = no_imagenet_score
+    eval_results['nights_total'] = {
+        div: (imagenet_score[div] * len(test_dataset_imagenet) +
+              no_imagenet_score[div] * len(test_dataset_no_imagenet)) / total_length
+        for div in args.mat_div
+    }
+    for div in args.mat_div:
+        logging.info(f"div={div}   Combined 2AFC score: {eval_results['nights_total'][div]:.4%}")
 
     logging.info(f"Saving to {os.path.join(output_path, 'eval_results.pkl')}")
     with open(os.path.join(output_path, 'eval_results.pkl'), "wb") as f:

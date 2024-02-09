@@ -61,25 +61,26 @@ class PerceptualModel(torch.nn.Module):
         self.normalize_embeds = normalize_embeds
         self.device = device
 
-    def forward(self, img_a, img_b):
+    def forward(self, img_a, img_b, mat_slice=None):
         """
         :param img_a: An RGB image passed as a (1, 3, 224, 224) tensor with values [0-1].
         :param img_b: Same as img_a.
         :return: A distance score for img_a and img_b. Higher means further/more different.
         """
-        embed_a = self.embed(img_a)
-        embed_b = self.embed(img_b)
+        embed_a = self.embed(img_a, mat_slice=mat_slice)
+        embed_b = self.embed(img_b, mat_slice=mat_slice)
         return 1 - F.cosine_similarity(embed_a, embed_b, dim=-1)
 
-    def embed(self, img):
+    def embed(self, img, mat_slice=None):
         """
         Returns an embedding of img. The perceptual distance is the cosine distance between two embeddings. If the
         embeddings are normalized then L2 distance can also be used.
         """
-        full_feats = (self.extract_feats_list[0](img, extractor_index=0)).squeeze()
-        for i in range(1, len(self.extract_feats_list)):
-            feats = (self.extract_feats_list[i](img, extractor_index=i)).squeeze()
-            full_feats = torch.cat((full_feats, feats), dim=-1)
+        full_feats = []
+        for ii, extract_fn in enumerate(self.extract_feats_list):
+            feats = extract_fn(img, extractor_index=ii, mat_slice=mat_slice).squeeze()
+            full_feats.append(feats)
+        full_feats = torch.cat(full_feats[::-1], dim=-1)  # original code prepends with a complex loop
         embed = self.mlp(full_feats)
         if self.normalize_embeds:
             embed = normalize_embedding(embed)
@@ -101,21 +102,21 @@ class PerceptualModel(torch.nn.Module):
         else:
             raise ValueError(f"Feature type {feat_type} is not supported.")
 
-        def extract(img, extractor_index):
+        def extract(img, extractor_index, mat_slice=None):
             prep_img = self._preprocess(img, model_type)
-            return extract_fn(prep_img, extractor_index=extractor_index)
+            return extract_fn(prep_img, extractor_index=extractor_index, mat_slice=mat_slice)
 
         return extract
 
-    def _extract_cls(self, img, extractor_index=0):
+    def _extract_cls(self, img, extractor_index=0, mat_slice=None):
         layer = 11
-        return self.extractor_list[extractor_index].extract_descriptors(img, layer)[:, :, :, 0, :]
+        return self.extractor_list[extractor_index].extract_descriptors(img, layer, mat_slice=mat_slice)[:, :, :, 0, :]
 
-    def _extract_embedding(self, img, extractor_index=0):
-        return self.extractor_list[extractor_index].forward(img, is_proj=True)
+    def _extract_embedding(self, img, extractor_index=0, mat_slice=None):
+        return self.extractor_list[extractor_index].forward(img, is_proj=True, mat_slice=mat_slice)
 
-    def _extract_last_layer(self, img, extractor_index=0):
-        return self.extractor_list[extractor_index].forward(img, is_proj=False)
+    def _extract_last_layer(self, img, extractor_index=0, mat_slice=None):
+        return self.extractor_list[extractor_index].forward(img, is_proj=False, mat_slice=mat_slice)
 
     def _preprocess(self, img, model_type):
         return transforms.Normalize(mean=self._get_mean(model_type), std=self._get_std(model_type))(img)

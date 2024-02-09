@@ -12,7 +12,9 @@ import torch
 from peft import get_peft_model, LoraConfig, PeftModel
 from dreamsim import PerceptualModel
 from dreamsim.feature_extraction.vit_wrapper import ViTModel, ViTConfig
+from typing import List
 import os
+import numpy as np
 import configargparse
 from tqdm import tqdm
 
@@ -64,6 +66,9 @@ def parse_args():
     parser.add_argument('--lora_alpha', type=float, default=0.1, help='Alpha for attention scaling')
     parser.add_argument('--lora_dropout', type=float, default=0.1, help='Dropout probability for LoRA layers')
 
+    parser.add_argument('--mat_div', type=int, nargs="+", default=[1])
+    parser.add_argument('--mat_weight', type=str, default='ones', choices=['ones', 'uniform', 'inv_sqrt', 'sqrt'])
+
     return parser.parse_args()
 
 
@@ -71,6 +76,7 @@ class LightningPerceptualModel(pl.LightningModule):
     def __init__(self, feat_type: str = "cls", model_type: str = "dino_vitb16", stride: str = "16", hidden_size: int = 1,
                  lr: float = 0.0003, use_lora: bool = False, margin: float = 0.05, lora_r: int = 16,
                  lora_alpha: float = 0.5, lora_dropout: float = 0.3, weight_decay: float = 0.0, train_data_len: int = 1,
+                 mat_div: List[int] = [1], mat_weight: str = 'uniform',
                  load_dir: str = "./models", device: str = "cuda",
                  **kwargs):
         super().__init__()
@@ -88,9 +94,26 @@ class LightningPerceptualModel(pl.LightningModule):
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
         self.train_data_len = train_data_len
+        self.mat_div = np.asarray(mat_div)
+        if mat_weight == 'ones':
+            self.mat_weight = np.ones(len(self.mat_div))
+        elif mat_weight == 'uniform':
+            self.mat_weight = np.asarray([1. for _ in mat_div]) / len(mat_div)
+        elif mat_weight == 'sqrt':
+            self.mat_weight = np.asarray(mat_div) ** (0.5)
+            self.mat_weight = self.mat_weight / np.sum(self.mat_weight)
+        elif mat_weight == 'inv_sqrt':
+            self.mat_weight = np.asarray(mat_div) ** (-0.5)
+            self.mat_weight = self.mat_weight / np.sum(self.mat_weight)
+        else:
+            raise ValueError(f"mat_weight={mat_weight}")
+        print(f"mat_div={self.mat_div.tolist()}")
+        print(f"mat_weight={self.mat_weight.tolist()}")
 
         self.started = False
-        self.val_metrics = {'loss': Mean().to(device), 'score': Mean().to(device)}
+        self.val_metrics = {}
+        for mat_div in self.mat_div:
+            self.val_metrics.update({f'loss_div{mat_div}': Mean().to(device), f'score_div{mat_div}': Mean().to(device)})
         self.__reset_val_metrics()
 
         self.perceptual_model = PerceptualModel(feat_type=self.feat_type, model_type=self.model_type, stride=self.stride,
@@ -103,45 +126,65 @@ class LightningPerceptualModel(pl.LightningModule):
 
         self.criterion = HingeLoss(margin=self.margin, device=device)
 
-        self.epoch_loss_train = 0.0
-        self.train_num_correct = 0.0
+        self.epoch_loss_train = {d: 0.0 for d in self.mat_div}
+        self.train_num_correct = {d: 0.0 for d in self.mat_div}
+        self.automatic_optimization = False
 
-    def forward(self, img_ref, img_0, img_1):
-        dist_0 = self.perceptual_model(img_ref, img_0)
-        dist_1 = self.perceptual_model(img_ref, img_1)
+
+    def forward(self, img_ref, img_0, img_1, mat_slice=None):
+        dist_0 = self.perceptual_model(img_ref, img_0, mat_slice=mat_slice)
+        dist_1 = self.perceptual_model(img_ref, img_1, mat_slice=mat_slice)
         return dist_0, dist_1
 
+
     def training_step(self, batch, batch_idx):
+        opt = self.optimizers()
+
+        # hardcode for dino-vit-b16
+        this_loss = 0.0
         img_ref, img_0, img_1, target, idx = batch
-        dist_0, dist_1 = self.forward(img_ref, img_0, img_1)
-        decisions = torch.lt(dist_1, dist_0)
-        logit = dist_0 - dist_1
-        loss = self.criterion(logit.squeeze(), target)
-        loss /= target.shape[0]
-        self.epoch_loss_train += loss
-        self.train_num_correct += ((target >= 0.5) == decisions).sum()
-        return loss
+        opt.zero_grad()
+        for mat_div, weight in zip(self.mat_div, self.mat_weight):
+            dist_0, dist_1 = self.forward(img_ref, img_0, img_1, mat_slice=(3072 // mat_div))
+            decisions = torch.lt(dist_1, dist_0)
+            logit = dist_0 - dist_1
+            loss = self.criterion(logit.squeeze(), target)
+            loss /= target.shape[0]
+            self.manual_backward(loss * weight)
+            this_loss += loss * weight
+            self.epoch_loss_train[mat_div] += loss
+            self.train_num_correct[mat_div] += ((target >= 0.5) == decisions).sum()
+        opt.step()
+        return this_loss
 
     def validation_step(self, batch, batch_idx):
+        this_loss = 0.0
         img_ref, img_0, img_1, target, id = batch
-        dist_0, dist_1 = self.forward(img_ref, img_0, img_1)
-        decisions = torch.lt(dist_1, dist_0)
-        logit = dist_0 - dist_1
-        loss = self.criterion(logit.squeeze(), target)
-        val_num_correct = ((target >= 0.5) == decisions).sum()
-        self.val_metrics['loss'].update(loss, target.shape[0])
-        self.val_metrics['score'].update(val_num_correct, target.shape[0])
+        for mat_div, weight in zip(self.mat_div, self.mat_weight):
+            dist_0, dist_1 = self.forward(img_ref, img_0, img_1, mat_slice=(3072 // mat_div))
+            decisions = torch.lt(dist_1, dist_0)
+            logit = dist_0 - dist_1
+            loss = self.criterion(logit.squeeze(), target)
+            this_loss += loss * weight
+            val_num_correct = ((target >= 0.5) == decisions).sum()
+            self.val_metrics[f'loss_div{mat_div}'].update(loss, target.shape[0])
+            self.val_metrics[f'score_div{mat_div}'].update(val_num_correct, target.shape[0])
         return loss
 
     def on_train_epoch_start(self):
-        self.epoch_loss_train = 0.0
-        self.train_num_correct = 0.0
+        self.epoch_loss_train = {d: 0.0 for d in self.mat_div}
+        self.train_num_correct = {d: 0.0 for d in self.mat_div}
         self.started = True
 
     def on_train_epoch_end(self):
         epoch = self.current_epoch + 1 if self.started else 0
-        self.logger.experiment.add_scalar(f'train_loss/', self.epoch_loss_train / self.trainer.num_training_batches, epoch)
-        self.logger.experiment.add_scalar(f'train_2afc_acc/', self.train_num_correct / self.train_data_len, epoch)
+        for k in self.epoch_loss_train:
+            self.logger.experiment.add_scalar(f'train_loss/div{k}/',
+                                              self.epoch_loss_train[k] / self.trainer.num_training_batches,
+                                              epoch)
+        for k in self.train_num_correct:
+            self.logger.experiment.add_scalar(f'train_2afc_acc/div{k}/',
+                                              self.train_num_correct[k] / self.train_data_len, epoch)
         if self.use_lora:
             self.__save_lora_weights()
 
@@ -154,14 +197,15 @@ class LightningPerceptualModel(pl.LightningModule):
 
     def on_validation_epoch_end(self):
         epoch = self.current_epoch + 1 if self.started else 0
-        score = self.val_metrics['score'].compute()
-        loss = self.val_metrics['loss'].compute()
+        for mat_div in self.mat_div:
+            loss = self.val_metrics[f'loss_div{mat_div}'].compute()
+            score = self.val_metrics[f'score_div{mat_div}'].compute()
 
-        self.log(f'val_acc_ckpt', score, logger=False)
-        self.log(f'val_loss_ckpt', loss, logger=False)
-        # log for tensorboard
-        self.logger.experiment.add_scalar(f'val_2afc_acc/', score, epoch)
-        self.logger.experiment.add_scalar(f'val_loss/', loss, epoch)
+            self.log(f'val_acc_div{mat_div}_ckpt', score, logger=False)
+            self.log(f'val_loss_div{mat_div}_ckpt', loss, logger=False)
+            # log for tensorboard
+            self.logger.experiment.add_scalar(f'val_2afc_acc/div{mat_div}/', score, epoch)
+            self.logger.experiment.add_scalar(f'val_loss/div{mat_div}/', loss, epoch)
 
         return score
 
@@ -172,6 +216,7 @@ class LightningPerceptualModel(pl.LightningModule):
         for extractor, feat_type in zip(self.perceptual_model.extractor_list, self.perceptual_model.feat_type_list):
             if feat_type == 'embedding':
                 params += [extractor.proj]
+        print('optimizing', sum(p.numel() for p in params if p.requires_grad), 'parameters')
         optimizer = torch.optim.Adam(params, lr=self.lr, betas=(0.5, 0.999), weight_decay=self.weight_decay)
         return [optimizer]
 
@@ -218,15 +263,20 @@ class LightningPerceptualModel(pl.LightningModule):
                 new_adapters_weights[new_k] = v
             torch.save(new_adapters_weights, os.path.join(save_dir, 'adapter_model.bin'))
 
+def to_camel_case(snake_str):
+    return "".join(x.capitalize() for x in snake_str.lower().split("_"))
 
 def run(args, device):
     tag = args.tag if len(args.tag) > 0 else ""
     training_method = "lora" if args.use_lora else "mlp"
     exp_dir = os.path.join(args.log_dir,
                            f'{tag}_{str(args.model_type)}_{str(args.feat_type)}_{str(training_method)}_' +
-                           f'lr_{str(args.lr)}_batchsize_{str(args.batch_size)}_wd_{str(args.weight_decay)}'
-                           f'_hiddensize_{str(args.hidden_size)}_margin_{str(args.margin)}'
+                           f'lr_{str(args.lr)}_batchsize_{str(args.batch_size)}_wd_{str(args.weight_decay)}_'
+                           f'hiddensize_{str(args.hidden_size)}_margin_{str(args.margin)}_' +
+                           f'matdiv' + ','.join(map(str, args.mat_div))
                            )
+    if args.mat_weight != 'ones':
+        exp_dir += to_camel_case(args.mat_weight)
     if args.use_lora:
         exp_dir += f'_lorar_{str(args.lora_r)}_loraalpha_{str(args.lora_alpha)}_loradropout_{str(args.lora_dropout)}'
 
@@ -247,7 +297,7 @@ def run(args, device):
                       logger=logger,
                       max_epochs=args.epochs,
                       default_root_dir=exp_dir,
-                      callbacks=ModelCheckpoint(monitor='val_loss_ckpt',
+                      callbacks=ModelCheckpoint(monitor='val_loss_div1_ckpt',
                                                 save_top_k=-1,
                                                 save_last=True,
                                                 filename='{epoch:02d}',

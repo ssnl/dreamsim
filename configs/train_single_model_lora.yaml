@@ -19,3 +19,5 @@ margin: 0.05
 lora_r: 16
 lora_alpha: 0.5
 lora_dropout: 0.3
+
+mat_div: [8, 4, 2, 1]

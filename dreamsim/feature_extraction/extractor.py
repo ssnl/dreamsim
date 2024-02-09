@@ -64,7 +64,8 @@ class ViTExtractor:
         """
         if 'dino' in model_type:
             torch.hub.set_dir(load_dir)
-            model = torch.hub.load('facebookresearch/dino:main', model_type)
+            model = torch.hub.load('facebookresearch/dino:main',
+                                   model_type[4:] if model_type.startswith('raw:') else model_type)
             if model_type == 'dino_vitb16':
                 sd = torch.load(os.path.join(load_dir, 'dino_vitb16_pretrain.pth'), map_location='cpu')
                 proj = DINOHead(768, 2048)
@@ -119,7 +120,7 @@ class ViTExtractor:
             # compute number of tokens taking stride into account
             w0 = 1 + (w - patch_size) // stride_hw[1]
             h0 = 1 + (h - patch_size) // stride_hw[0]
-            assert (w0 * h0 == npatch), f"""got wrong grid size for {h}x{w} with patch_size {patch_size} and 
+            assert (w0 * h0 == npatch), f"""got wrong grid size for {h}x{w} with patch_size {patch_size} and
                                             stride {stride_hw} got {h0}x{w0}={h0 * w0} expecting {npatch}"""
             # we add a small number to avoid floating point error in the interpolation
             # see discussion at https://github.com/facebookresearch/dino/issues/8
@@ -158,21 +159,21 @@ class ViTExtractor:
         model.interpolate_pos_encoding = types.MethodType(ViTExtractor._fix_pos_enc(patch_size, stride), model)
         return model
 
-    def forward(self, x, is_proj=False):
+    def forward(self, x, is_proj=False, mat_slice=None):
         if is_proj:
             if 'clip' in self.model_type:
-                return self.model(x) @ self.proj.to(self.device)
+                return self.model(x, mat_slice=mat_slice) @ self.proj.to(self.device)
             elif 'dino' in self.model_type:
                 if self.model_type == 'dino_vitb16':
                     self.proj = self.proj.to(self.device)
-                    return self.proj(self.model(x))
+                    return self.proj(self.model(x, mat_slice=mat_slice))
                 raise NotImplementedError
             elif 'mae' in self.model_type:
                 raise NotImplementedError
             else:
                 raise NotImplementedError
         else:
-            return self.model(x)
+            return self.model(x, mat_slice=mat_slice)
 
     def _get_drop_hook(self, drop_rate):
 
@@ -201,7 +202,7 @@ class ViTExtractor:
             self._feats.append(output)
         return _hook
 
-    def _register_hooks(self, layers: List[int],drop_rate=0) -> None:
+    def _register_hooks(self, layers: List[int], drop_rate=0) -> None:
         """
         register hook to extract features.
         :param layers: layers from which to extract features.
@@ -220,7 +221,7 @@ class ViTExtractor:
             handle.remove()
         self.hook_handlers = []
 
-    def _extract_features(self, batch: torch.Tensor, layers: List[int] = 11, drop_rate=0) -> List[torch.Tensor]:
+    def _extract_features(self, batch: torch.Tensor, layers: List[int] = 11, drop_rate=0, mat_slice=None) -> List[torch.Tensor]:
         """
         extract features from the model
         :param batch: batch to extract features for. Has shape BxCxHxW.
@@ -231,7 +232,7 @@ class ViTExtractor:
         self._feats = []
         self._register_hooks(layers, drop_rate)
         try:
-            _ = self.model(batch)
+            _ = self.model(batch, mat_slice=mat_slice)
             self._unregister_hooks()
         except Exception as e:
             self._unregister_hooks()
@@ -240,7 +241,7 @@ class ViTExtractor:
         self.num_patches = (1 + (H - self.p) // self.stride[0], 1 + (W - self.p) // self.stride[1])
         return self._feats
 
-    def extract_descriptors(self, batch: torch.Tensor, layer: int = 11, drop_rate=0) -> torch.Tensor:
+    def extract_descriptors(self, batch: torch.Tensor, layer: int = 11, drop_rate=0, mat_slice=None) -> torch.Tensor:
         """
         extract descriptors from the model
         :param batch: batch to extract descriptors for. Has shape BxCxHxW.
@@ -250,7 +251,7 @@ class ViTExtractor:
         if type(layer) is not list:
             layer = [ layer ]
 
-        self._extract_features(batch, layer, drop_rate)
+        self._extract_features(batch, layer, drop_rate, mat_slice=mat_slice)
         x = torch.stack(self._feats, dim=1)
         x = x.unsqueeze(dim=2) #Bxlx1xtxd # Default to facet = "token", always include CLS token
         desc = x.permute(0, 1, 3, 4, 2).flatten(start_dim=-2, end_dim=-1).unsqueeze(dim=2)  # Bxlx1xtx(dxh)

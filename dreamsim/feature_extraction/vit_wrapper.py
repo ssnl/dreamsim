@@ -15,5 +15,5 @@ class ViTModel(PreTrainedModel):
         self.model = model
         self.blocks = model.blocks
 
-    def forward(self, x):
-        return self.model(x)
+    def forward(self, x, **kwargs):
+        return self.model(x, **kwargs)
